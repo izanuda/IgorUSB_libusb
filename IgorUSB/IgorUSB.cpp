@@ -16,9 +16,20 @@
 #define HEADER_LENGTH 3
 #define MAX_BUFFER_SIZE 256
 
+enum TransferStatus {
+    NoError,
+    ErrorNoDevice,
+    ErrorTransfer
+};
+
+// Globals
 libusb_context* gContext = NULL;
 libusb_device_handle* gDevice = NULL;
 
+// 
+static TransferStatus SendToDevice(uint8_t fn, uint16_t param1, uint16_t param2, unsigned char *buf, uint16_t buf_size, uint16_t * transf_bytes = NULL);
+
+// implementation
 bool OpenDevice()
 {
     if(gDevice)
@@ -31,7 +42,7 @@ bool OpenDevice()
             int err = libusb_init(&gContext);
             if(err)
             {
-                OutputDebugStringA("Failed to initialize libusb.");
+                OutputDebugString(TEXT("Failed to initialize libusb."));
                 gContext = NULL;
                 return false;
             }
@@ -40,7 +51,7 @@ bool OpenDevice()
         gDevice = libusb_open_device_with_vid_pid(gContext, VENDOR_ATMEL, DEVICE_IGORPLUG);
         if(gDevice)
         {
-            OutputDebugStringA("Found IgorPlugUSB device.");
+            OutputDebugString(TEXT("Found IgorPlugUSB device."));
             return true;
         }
     }
@@ -61,20 +72,49 @@ void CloseDevice()
     }
 }
 
-bool SendToDevice(uint8_t fn, uint16_t param1, uint16_t param2, unsigned char* buf, uint16_t buf_size, int& recvd_bytes)
+TransferStatus SendToDevice(uint8_t fn, uint16_t param1, uint16_t param2, unsigned char *buf, uint16_t buf_size, uint16_t * transf_bytes)
 {
+    if (transf_bytes)
+        *transf_bytes = 0;
+
     if(OpenDevice())
     {
-        recvd_bytes = libusb_control_transfer(gDevice, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN, fn, param1, param2, buf, buf_size, 500);
-        if(recvd_bytes < 0)
+        int result = libusb_control_transfer(gDevice, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN, fn, param1, param2, buf, buf_size, 500);
+        if(result < LIBUSB_SUCCESS)
         {
-            OutputDebugStringA(libusb_strerror((libusb_error)recvd_bytes));
+            const char * error_str = libusb_strerror(libusb_error(result));
+#if defined(UNICODE)
+            size_t newsize = strlen(error_str) + 1;
+            wchar_t * wcstring = new wchar_t[newsize];
+            // Convert char* string to a wchar_t* string.
+            size_t convertedChars = 0;
+            mbstowcs_s(&convertedChars, wcstring, newsize, error_str, _TRUNCATE);
+            OutputDebugString(wcstring);
+            delete[] wcstring;
+#else
+            OutputDebugString(error_str);
+#endif
             CloseDevice();
-        }
 
-        return true;
+            if (result == LIBUSB_ERROR_NO_DEVICE)
+                return ErrorNoDevice;
+            else
+                return ErrorTransfer;
+        }
+        else
+        {
+            if(result > UINT16_MAX)
+            {
+                OutputDebugString(TEXT("Unexpected: too many bytes transferrer"));
+                if (transf_bytes)
+                    *transf_bytes = UINT16_MAX;
+            }
+            else if (transf_bytes)
+                *transf_bytes = uint16_t(result);
+            return NoError;
+        }
     }
-    return false;
+    return ErrorNoDevice;
 }
 
 IGORUSB_API int __stdcall DoSetInfraBufferEmpty()
@@ -82,27 +122,27 @@ IGORUSB_API int __stdcall DoSetInfraBufferEmpty()
     int result = IGORUSB_DEVICE_NOT_PRESENT;
 
     unsigned char buf[2];
-    uint16_t buf_size = 1;
-    int recvd_bytes;
 
-    if(SendToDevice(DO_SET_INFRA_BUFFER_EMPTY, 0, 0, buf, buf_size, recvd_bytes))
+    if(SendToDevice(DO_SET_INFRA_BUFFER_EMPTY, 0, 0, buf, 1, NULL) == NoError)
         result = NO_ERROR;
 
     return result;
 }
 
-IGORUSB_API int __stdcall DoGetInfraCode(unsigned char* TimeCodeDiagram, int /*DummyInt*/, int* DiagramLength)
+IGORUSB_API int __stdcall DoGetInfraCode(unsigned char * TimeCodeDiagram, int /*DummyInt*/, int * DiagramLength)
 {
-    unsigned char buf[MAX_BUFFER_SIZE];
-    int bytes_to_read = 0;
-    int i, buf_size, recvd, msg_idx, j, k, last_written_idx;
     static int last_read = -1;
 
+    unsigned char buf[MAX_BUFFER_SIZE];
     memset(buf, 0, sizeof(buf));
-    *DiagramLength = 0;
 
-    if(!SendToDevice(DO_GET_INFRA_CODE, 0, 0, buf, 3, recvd))
+    if(DiagramLength)
+        *DiagramLength = 0;
+
+    uint16_t recvd;
+    if (SendToDevice(DO_GET_INFRA_CODE, 0, 0, buf, 3, &recvd) != NoError)
     {
+        last_read = -1;
         return IGORUSB_DEVICE_NOT_PRESENT;
     }
 
@@ -112,29 +152,29 @@ IGORUSB_API int __stdcall DoGetInfraCode(unsigned char* TimeCodeDiagram, int /*D
         return NO_ERROR;
     }
 
-    bytes_to_read = buf[0];
+    uint16_t bytes_to_read = buf[0];
     if(bytes_to_read == 0)
         return NO_ERROR;
-    msg_idx = buf[1];
-    last_written_idx = buf[2];
 
-    i = 0;
+    int msg_idx = buf[1];
+    int last_written_idx = buf[2];
+
+    uint16_t buf_size;
+    uint16_t i = 0;
     while(i < bytes_to_read)
     {
         buf_size = bytes_to_read - i;
         if(buf_size > MAX_BUFFER_SIZE)
         {
-            OutputDebugString(L"buffer is too small");
+            OutputDebugString(TEXT("Buffer is too small."));
             break;
         }
 
-        if(!SendToDevice(DO_GET_INFRA_CODE, (uint16_t)i + HEADER_LENGTH, 0, &buf[i], (uint16_t)buf_size, recvd))
-            return IGORUSB_DEVICE_NOT_PRESENT;
-
-        if(recvd < 0)
+        TransferStatus stat = SendToDevice(DO_GET_INFRA_CODE, i + HEADER_LENGTH, 0, &buf[i], buf_size, &recvd);
+        if (stat != NoError)
         {
             last_read = -1;
-            return DoSetInfraBufferEmpty();
+            return (stat == ErrorNoDevice)? IGORUSB_DEVICE_NOT_PRESENT : DoSetInfraBufferEmpty();
         }
 
         i += recvd;
@@ -143,25 +183,23 @@ IGORUSB_API int __stdcall DoGetInfraCode(unsigned char* TimeCodeDiagram, int /*D
     if(msg_idx != last_read)
     {
         // new message
-        j = last_written_idx % bytes_to_read;
-        k = 0;
-        for(i=j; i<bytes_to_read; ++i)
-        {
-            TimeCodeDiagram[k] = buf[i];
-            ++k;
-        }
-        for(i=0; i<j; ++i)
-        {
-            TimeCodeDiagram[k] = buf[i];
-            ++k;
-        }
-        *DiagramLength = bytes_to_read;
+        uint16_t j = last_written_idx % bytes_to_read;
+        int k = 0;
+        for (i = j; i < bytes_to_read; ++i)
+            TimeCodeDiagram[k++] = buf[i];
+
+        for (i = 0; i < j; ++i)
+            TimeCodeDiagram[k++] = buf[i];
+
+        if(DiagramLength)
+            *DiagramLength = bytes_to_read;
     }
     else
     {
         // message is repeated (has same index as before)
         // -> do nothing
-        *DiagramLength = 0;
+        if (DiagramLength)
+            *DiagramLength = 0;
     }
     last_read = msg_idx;
 
@@ -175,7 +213,8 @@ IGORUSB_API int __stdcall DoSetDataPortDirection(unsigned char /*DirectionByte*/
 
 IGORUSB_API int __stdcall DoGetDataPortDirection(unsigned char * DataDirectionByte)
 {
-    *DataDirectionByte = 0;
+    if (DataDirectionByte)
+        *DataDirectionByte = 0;
     return IGORUSB_NOT_IMPLEMENTED;
 }
 
@@ -186,19 +225,22 @@ IGORUSB_API int __stdcall DoSetOutDataPort(unsigned char /*DataOutByte*/)
 
 IGORUSB_API int __stdcall DoGetOutDataPort(unsigned char * DataOutByte)
 {
-    *DataOutByte = 0;
+    if (DataOutByte)
+        *DataOutByte = 0;
     return IGORUSB_NOT_IMPLEMENTED;
 }
 
 IGORUSB_API int __stdcall DoGetInDataPort(unsigned char * DataInByte)
 {
-    *DataInByte = 0;
+    if (DataInByte)
+        *DataInByte = 0;
     return IGORUSB_NOT_IMPLEMENTED;
 }
 
 IGORUSB_API int __stdcall DoEEPROMRead(unsigned char /*Address*/, unsigned char * DataInByte)
 {
-    *DataInByte = 0;
+    if (DataInByte)
+        *DataInByte = 0;
     return IGORUSB_NOT_IMPLEMENTED;
 }
 
@@ -214,7 +256,8 @@ IGORUSB_API int __stdcall DoRS232Send(unsigned char /*DataOutByte*/)
 
 IGORUSB_API int __stdcall DoRS232Read(unsigned char * DataInByte)
 {
-    *DataInByte = 0;
+    if (DataInByte)
+        *DataInByte = 0;
     return IGORUSB_NOT_IMPLEMENTED;
 }
 
@@ -225,6 +268,7 @@ IGORUSB_API int __stdcall DoSetRS232Baud(int /*BaudRate*/)
 
 IGORUSB_API int __stdcall DoGetRS232Baud(int * BaudRate)
 {
-    *BaudRate = 0;
+    if (BaudRate)
+        *BaudRate = 0;
     return IGORUSB_NOT_IMPLEMENTED;
 }
